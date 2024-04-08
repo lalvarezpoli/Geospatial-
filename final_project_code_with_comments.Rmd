@@ -1,0 +1,640 @@
+---
+title: "Geospatial_final"
+author: "Oliver Gatland"
+date: "2024-03-27"
+output: html_document
+---
+
+## Geospatial Final project
+
+### Oliver Gatland, Luis Francisco Alvarez, Richard O’Shea
+
+#### In this markdown file we include all the code used for our Geospatial final project. Please see the accompanying write up for more detailed explanations of the research.
+
+```{r include=FALSE}
+setwd("C:/Users/gatla/OneDrive/BSE/Geospatial/Final_project/")
+library(stargazer)
+library(spData)
+library(sf)
+library(tidyverse)
+library(terra)
+library(raster)
+library(units)
+library(exactextractr)
+library(sp)
+library(zoo)
+library(gdistance)
+library(gganimate)
+library(gifski)
+library(magick)
+```
+
+## Data preparation - distance variable
+
+```{r}
+# Load data
+sf.cities<-st_read("C:/Users/gatla/OneDrive/BSE/Geospatial/homework/homework3/ne_10m_populated_places/ne_10m_populated_places.shp")
+
+# Countries to remove - non Sub Saharan countries or never eligible for AGOA
+remove_names <-c("Libya","Tunisia","Algeria","Eritrea","Morocco","Egypt","Sudan","Somalia") 
+
+# Countries to include
+maritime <-c("Sudan", "Djibouti","Eritrea","Kenya", "United Republic of Tanzania","South Africa", "Namibia","Angola","Gabon","Congo (Brazzaville)","Cameroon","Nigeria","Benin","Togo","Ghana","Ivory Coast","Liberia","Sierra Leone","Guinea", "Guinea Bissau", "Senegal", "Mauritania")
+```
+
+```{r}
+# Country level data on Africa adjusting some country names
+sf.Africa <-world%>%
+  filter(continent=='Africa')%>%
+  mutate(name_long = case_when(
+    name_long == "Tanzania" ~ "United Republic of Tanzania",
+    TRUE ~ name_long 
+  ))%>%
+  mutate(name_long = case_when(
+    name_long == "Guinea-Bissau" ~ "Guinea Bissau",
+    TRUE ~ name_long 
+  ))%>%
+  mutate(name_long = case_when(
+    name_long == "Republic of the Congo" ~ "Congo (Brazzaville)",
+    TRUE ~ name_long
+  ))%>%
+  mutate(name_long = case_when(
+    name_long == "Côte d'Ivoire" ~ "Ivory Coast",
+    TRUE ~ name_long 
+  ))%>%
+  mutate(name_long = case_when(
+    name_long == "The Gambia" ~ "Gambia, The",
+    TRUE ~ name_long 
+  ))
+```
+
+```{r}
+# Subset populated places data to Africa, this was necessary as cities did not have a country variable
+sf.africa_cities <- st_intersection(sf.cities,sf.Africa)%>% 
+  dplyr::select(NAME,POP_MAX,SOV0NAME,name_long)
+```
+
+```{r}
+# Load road data adjusting country names and standardising link roads
+sf.roads <- st_read("C:/Users/gatla/OneDrive/BSE/Geospatial/Final_project/AFR_Infra_Transport_Road.shp/AFR_Infra_Transport_Road.shp")%>%
+  mutate(Country = case_when(
+    Country == "Tanzania" ~ "United Republic of Tanzania",
+    TRUE ~ Country # Keeps the original value if the condition above is not met
+  ))%>%
+  mutate(Country = case_when(
+    Country == "Guinea-Bissau" ~ "Guinea Bissau",
+    TRUE ~ Country # Keeps the original value if the condition above is not met
+  ))%>%
+  mutate(Country = case_when(
+    Country == "Côte d’Ivoire" ~ "Ivory Coast",
+    TRUE ~ Country # Keeps the original value if the condition above is not met
+  ))%>%
+  mutate(Country = case_when(
+    Country == "Senegal and The Gambia" ~ "Senegal",
+    TRUE ~ Country # Keeps the original value if the condition above is not met
+  ))%>%
+  mutate(FeatureTyp = case_when(
+    FeatureTyp == "Road (Motorway Link)" ~ "Road (Motorway)",
+    TRUE ~ FeatureTyp # Keeps the original value if the condition above is not met
+  ))%>%
+  mutate(FeatureTyp = case_when(
+    FeatureTyp == "Road (Trunk Link)" ~ "Road (Trunk)",
+    TRUE ~ FeatureTyp # Keeps the original value if the condition above is not met
+  ))%>%
+  mutate(FeatureTyp = case_when(
+    FeatureTyp == "Road (Primary Link)" ~ "Road (Primary)",
+    TRUE ~ FeatureTyp # Keeps the original value if the condition above is not met
+  ))%>%
+  mutate(FeatureTyp = case_when(
+    FeatureTyp == "Road (Secondary Link)" ~ "Road (Secondary)",
+    TRUE ~ FeatureTyp # Keeps the original value if the condition above is not met
+  ))
+```
+
+```{r}
+#Load ports as point data and with a buffer. The buffer was necessary as ports did not have a country and the buffer allowed us to identify the country for ports slightly away from the coast on them map
+sf.africa_ports_point<- st_read("C:/Users/gatla/OneDrive/BSE/Geospatial/Final_project/ne_10m_ports/ne_10m_ports.shp")%>%
+  st_crop(sf.Africa)
+
+sf.africa_ports_buff <- st_read("C:/Users/gatla/OneDrive/BSE/Geospatial/Final_project/ne_10m_ports/ne_10m_ports.shp")%>%
+  st_crop(sf.Africa)%>%
+  st_buffer(dist=20000)
+```
+
+```{r}
+# Join ports data based on name from Africa data
+sf.Africa_names <-sf.Africa%>%
+  dplyr::select(name_long)
+sf.africa_ports_buffed<-st_join(sf.africa_ports_buff,sf.Africa_names)%>%
+  st_drop_geometry()
+sf.africa_ports<-st_join(sf.africa_ports_point,sf.Africa_names)
+
+sf.africa_port_final<-sf.africa_ports%>%
+  left_join(sf.africa_ports_buffed,by = "ne_id")%>%
+  dplyr::select(name.y,name_long.y)%>%
+  rename(name_long=name_long.y)
+
+rm(sf.africa_ports_buffed)
+rm(sf.africa_ports_point)
+rm(sf.africa_ports_buff)
+
+# Add empty dataframe to store distance data
+results_sf <- st_sf(city=character(), country=character(), min_dist=numeric(), geometry=st_sfc(), crs=4326)
+
+```
+
+```{r}
+# Set up directory to save plots
+plots_dir <- "plots_weight_agoa"
+dir.create(plots_dir)
+```
+
+
+Loop through each country and find the shortest distance between the cities and the nearest port within the same country.
+```{r}
+for (c in maritime) {
+  print(c)
+  
+  
+  sf.port<-sf.africa_port_final%>%filter(name_long==c)
+  sf.city<-sf.africa_cities%>%filter(name_long==c)
+  sf.road<-sf.roads%>%filter(Country==c)
+  sf.country <-sf.Africa%>%filter(name_long==c)
+  
+  #Creating an empty raster with same extent as our country's shapefile
+  r.blank_master <- rast()%>%
+    project("EPSG:4326")%>% #specifies the CRS of the raster
+    crop(sf.country,extend=TRUE,snap="out") #snap='out' ensures the extent covers the entire country, without this some cities were being cut off
+  res(r.blank_master)<-0.05#setting the resolution to a reasonable amount. Smaller values can cause very long computation times
+  
+  #A loop which creates an intermediate empty raster as before and then adds the road shapefile, by road type, assigning a different value
+  for (i in unique(sf.road$FeatureTyp)) {
+    sf.int_road <- sf.road%>%filter(FeatureTyp==i)
+    r.blank <- rast()%>%
+      project("EPSG:4326")%>% #had to use this specific 
+      crop(sf.country,extend=TRUE,snap="out")
+    res(r.blank)<-0.05
+    r.int_rast <- rasterize(vect(sf.int_road),r.blank) #creating the raster with the road network from the blank raster
+    vv<-values(r.int_rast)
+    
+    #Assigning the values - chosen intuitively to reflect differences in road quality
+    if (i== "Road (Motorway)") {
+      vv[!is.na(vv)] <- 1
+    } else if (i== "Road (Trunk)") {
+      vv[!is.na(vv)] <- 0.9
+    } else if (i== "Road (Primary)") {
+      vv[!is.na(vv)] <- 0.7
+    } else if (i== "Road (Secondary)") {
+      vv[!is.na(vv)] <- 0.6
+    }
+    
+    values(r.int_rast) <- vv
+    r.blank_master<-merge(r.blank_master,r.int_rast) #This then adds the intermediate rasters to the original, recreating the entire road network but with different values
+    
+  }
+  master_vals <-values(r.blank_master)
+  master_vals[is.na(master_vals)]<-0.01
+  values(r.blank_master)<-master_vals
+  
+  tr.matrix <- transition(
+    x = raster::raster(r.blank_master), #now the transition matrix accounts for different road types
+    transitionFunction = mean,
+    directions = 8
+  )
+  
+  plot(r.blank_master)
+  plot(sf.country$geom,add=TRUE)
+  plot(sf.city$geometry,col="red",pch=10,add=TRUE)
+  plot(sf.road$geometry,colour="green",add=TRUE)
+  plot(sf.port$geometry, col = "red", pch = 19, cex = 2, add = TRUE)
+  
+  #A loop which the path for each city to each port, saving only the path to the most easily accessible port
+  for (i in 1:nrow(sf.city)) {
+    print(i)
+    int_sf <- st_sf(city=character(), country=character(), min_dist=numeric(), geometry=st_sfc(), crs=4326)
+    for (j in 1:nrow(sf.port)) {
+      start <- as_Spatial(sf.city[i,]) #cities must be saved as spatial points for the shortestPath function 
+      end <- as_Spatial(sf.port[j,])
+      costPath <- shortestPath(x=tr.matrix, origin=start, goal=end, output="SpatialLines") #this function finds the shortest path between two points based off a transition matrix, which is based off our road raster
+      crs(costPath) <- CRS("+init=epsg:4326") #we project the raster before converting to a linestring. This ensures our projection is correct and our units are metres
+      distance_1 <- st_as_sf(costPath)
+      distance<-st_length(distance_1)
+      name <- sf.city$NAME[i]
+      country<-c
+      int_row_sf <- st_sf(city=name, country=country, min_dist=distance, geometry=st_sfc(st_as_sfc(distance_1)), crs=4326)
+      int_sf <- rbind(int_sf, int_row_sf)
+    }
+    row_with_min_dist <- int_sf %>%
+      slice_min(order_by = min_dist, n = 1)
+    
+    # Append to the results sf dataframe
+    results_sf <- rbind(results_sf, row_with_min_dist)
+    
+  }
+  sf.country_result<-results_sf%>%filter(country==c)
+  
+  #saving our plots
+  p<-ggplot()+
+    geom_sf(data=sf.country)+
+    geom_sf(data=sf.country_result,colour="red")+
+    geom_sf(data=sf.road,colour="grey80",aes(linetype=FeatureTyp))+
+    geom_sf(data=sf.city,aes(size = POP_MAX), shape = 21, fill = "blue")+
+    geom_sf(data=sf.port,colour="green",size=3,shape=15)+
+    scale_size_continuous(name = "Population Size",, range = c(1, 5))+
+    scale_linetype_manual(values=c("solid", "dashed", "dotted", "dotdash"))+
+    ggtitle(paste("Nation:", c))
+  
+  file_name <- paste(plots_dir, sprintf("plot_%s.png", c), sep = "/")
+  ggsave(file_name, plot = p, width = 10, height = 10)
+    
+}
+```
+
+```{r}
+# Save distance variable in dataframe
+#st_write(results_sf, "AFRICA_COAST_weights_agoa.csv", row.names = FALSE)
+```
+```{r}
+ggplot()+
+  geom_sf(data=sf.Africa)+
+  geom_sf(data=results_sf,aes(colour=country),)+
+  geom_sf(data=sf.africa_port_final%>%filter(name_long %in% maritime),colour="black",shape=19,size=1)+
+  guides(colour = FALSE)
+```
+
+
+## Data preparation - nightlights
+
+
+```{r}
+# Polygon data of Africa
+sf.Africa <- world%>%
+  filter(continent=='Africa')
+
+# Rename countries in sf.Africa so they match the Populated Places data
+sf.Africa$name_long[sf.Africa$name_long == "Republic of the Congo"] <- "Congo (Brazzaville)"
+sf.Africa$name_long[sf.Africa$name_long == "Côte d'Ivoire"] <- "Ivory Coast"
+sf.Africa$name_long[sf.Africa$name_long == "Guinea-Bissau"] <- "Guinea Bissau"
+
+# Load African cities and add buffer around each of them
+sf.cities<-st_read("C:/Users/gatla/OneDrive/BSE/Geospatial/homework/homework3/ne_10m_populated_places/ne_10m_populated_places.shp")
+sf.africa_cities <- st_intersection(sf.cities,sf.Africa) %>%
+  st_buffer(dist=10000)%>%
+  dplyr::select(NAME,ADM0NAME,ADM1NAME,POP_MAX)
+```
+
+```{r}
+# Define countries of interest
+maritime <-c("Sudan", "Eritrea","Djibouti","Kenya", "Tanzania",
+             "South Africa", "Namibia","Angola","Gabon","Congo (Brazzaville)","Cameroon",
+             "Nigeria","Benin","Togo","Ghana","Ivory Coast","Liberia","Sierra Leone",
+             "Guinea", "Guinea Bissau", "Senegal", "Mauritania")
+
+non_agoa <-c("Tunisia", "Morocco") #for our pseudo trial
+```
+
+We filter our data into three seperate dataframes. One for our main econometrics analysis, one for the pseudo treatment analysis, and one at a country level for the nightlight v GDP comparison.
+```{r}
+# Below filters for maritime cities in AGOA
+sf.agoa_cities<-sf.africa_cities%>%
+  filter(ADM0NAME %in% maritime)
+
+# Filter for non-agoa nations
+sf.non_agoa_cities<-sf.africa_cities%>%
+  filter(ADM0NAME %in% non_agoa)
+
+# Filter africa data just by countries of interest
+sf.Africa<-sf.Africa%>%
+  filter(name_long %in% maritime)
+```
+
+We noticed there were two places called Middelburg in South Africa, so we rename them here.
+```{r}
+# There are two Middelburgs in South Africa - rename now so they can be matched correctly with distance data
+subset_agoa <- subset(sf.agoa_cities, NAME == "Middelburg")
+subset_agoa
+
+# Re-name manually based on the index
+sf.agoa_cities[137, "NAME"] <- "Middelburg_mpu"
+sf.agoa_cities[176, "NAME"] <- "Middelburg_ec"
+```
+
+
+Now we load in the nightlight data
+```{r}
+setwd("C:/Users/gatla/OneDrive/BSE/Geospatial/Final_project")
+# Nightlight file paths here
+file_paths <- c("F101992.v4/F101992.v4b_web.stable_lights.avg_vis.tif/F101992.v4b_web.stable_lights.avg_vis.tif",
+                "F101993.v4/F101993.v4b_web.stable_lights.avg_vis.tif/F101993.v4b_web.stable_lights.avg_vis.tif",
+                "F121994.v4/F121994.v4b_web.stable_lights.avg_vis.tif/F121994.v4b_web.stable_lights.avg_vis.tif",
+                "F121995.v4/F121995.v4b_web.stable_lights.avg_vis.tif/F121995.v4b_web.stable_lights.avg_vis.tif",
+                "F121996.v4/F121996.v4b_web.stable_lights.avg_vis.tif/F121996.v4b_web.stable_lights.avg_vis.tif",
+                "F141997.v4/F141997.v4b_web.stable_lights.avg_vis.tif/F141997.v4b_web.stable_lights.avg_vis.tif",
+                "F141998.v4/F141998.v4b_web.stable_lights.avg_vis.tif/F141998.v4b_web.stable_lights.avg_vis.tif",
+                "F141999.v4/F141999.v4b_web.stable_lights.avg_vis.tif/F141999.v4b_web.stable_lights.avg_vis.tif",
+                "F142000.v4/F142000.v4b_web.stable_lights.avg_vis.tif/F142000.v4b_web.stable_lights.avg_vis.tif",
+                "F142001.v4/F142001.v4b_web.stable_lights.avg_vis.tif/F142001.v4b_web.stable_lights.avg_vis.tif",
+                "F142002.v4/F142002.v4b_web.stable_lights.avg_vis.tif/F142002.v4b_web.stable_lights.avg_vis.tif",
+                "F142003.v4/F142003.v4b_web.stable_lights.avg_vis.tif/F142003.v4b_web.stable_lights.avg_vis.tif",
+                "F152004.v4/F152004.v4b_web.stable_lights.avg_vis.tif/F152004.v4b_web.stable_lights.avg_vis.tif",
+                "F152005.v4/F152005.v4b_web.stable_lights.avg_vis.tif/F152005.v4b_web.stable_lights.avg_vis.tif",
+                "F152006.v4/F152006.v4b_web.stable_lights.avg_vis.tif/F152006.v4b_web.stable_lights.avg_vis.tif",
+                "F152007.v4/F152007.v4b_web.stable_lights.avg_vis.tif/F152007.v4b_web.stable_lights.avg_vis.tif",
+                "F162008.v4/F162008.v4b_web.stable_lights.avg_vis.tif/F162008.v4b_web.stable_lights.avg_vis.tif",
+                "F162009.v4/F162009.v4b_web.stable_lights.avg_vis.tif/F162009.v4b_web.stable_lights.avg_vis.tif",
+                "F182010.v4/F182010.v4d_web.stable_lights.avg_vis.tif/F182010.v4d_web.stable_lights.avg_vis.tif",
+                "F182011.v4/F182011.v4c_web.stable_lights.avg_vis.tif/F182011.v4c_web.stable_lights.avg_vis.tif",
+                "F182012.v4/F182012.v4c_web.stable_lights.avg_vis.tif/F182012.v4c_web.stable_lights.avg_vis.tif",
+                "F182013.v4/F182013.v4c_web.stable_lights.avg_vis.tif/F182013.v4c_web.stable_lights.avg_vis.tif")
+```
+
+Here we loop through nightlights for each year and extract the pixel sum of nightlights for each area.
+```{r}
+# Loop over file paths and extract sum of nightlights for each area
+# For dataframe of agoa countries, non-agoa countries and at a country level for Africa dataframe
+for (i in seq_along(file_paths)) {
+  # Load raster
+  r <- raster(file_paths[i])
+  col_name <- paste0("nl_score_", 1991 + i)
+  
+  # Crop raster to Africa
+  cropped_r <- crop(r, sf.Africa)
+  
+  r.zonal_ag <- exact_extract(
+    x = cropped_r, # raster
+    y = sf.agoa_cities, # polygon
+    fun = 'sum') # statistic
+  
+  r.zonal_nag <- exact_extract(
+    x = cropped_r, # raster
+    y = sf.non_agoa_cities, # polygon
+    fun = 'sum') # statistic  
+  
+  r.zonal_af <- exact_extract(
+    x = cropped_r, # raster
+    y = sf.Africa, # polygon
+    fun = 'sum') # statistic
+  
+  sf.agoa_cities[[col_name]] <- r.zonal_ag
+  sf.non_agoa_cities[[col_name]] <- r.zonal_nag
+  sf.Africa[[col_name]] <- r.zonal_af
+}
+```
+
+```{r}
+# Drop geometry
+agoa_cities <- st_drop_geometry(sf.agoa_cities)
+non_agoa_cities <- st_drop_geometry(sf.non_agoa_cities)
+africa <- st_drop_geometry(sf.Africa)
+```
+
+
+Our data is currently in wide format, but for our analysis it is most useful for it to be in long fomat, so we pivot the data here.
+```{r}
+# Convert data to long format
+agoa_cities_long <- agoa_cities %>%
+  pivot_longer(cols = starts_with("nl_score"),
+               names_to = "year",
+               values_to = "nl_score")%>%
+  mutate(year = gsub("nl_score_", "", year))
+
+non_agoa_cities_long <- non_agoa_cities %>%
+  pivot_longer(cols = starts_with("nl_score"),
+               names_to = "year",
+               values_to = "nl_score")%>%
+  mutate(year = gsub("nl_score_", "", year))
+
+africa_long <- africa %>%
+  pivot_longer(cols = starts_with("nl_score"),
+               names_to = "year",
+               values_to = "nl_score")%>%
+  mutate(year = gsub("nl_score_", "", year))
+
+# Convert year to numeric
+agoa_cities_long$year <- as.numeric(agoa_cities_long$year)
+non_agoa_cities_long$year <- as.numeric(non_agoa_cities_long$year)
+```
+
+
+## Nightlight v GDP comparison
+```{r}
+# Load GDP data
+setwd("C:/Users/gatla/OneDrive/BSE/Geospatial/Final_project/")
+gdp <- read.csv("API_NY.GDP.MKTP.CD_DS2_en_csv_v2_2/API_NY.GDP.MKTP.CD_DS2_en_csv_v2_2.csv", skip = 4)
+
+# Drop unwanted cols
+gdp <- subset(gdp, select = -c(Country.Code, Indicator.Name, Indicator.Code))
+
+# Change country names in GDP data so they match with Africa country data
+gdp$Country.Name[gdp$Country.Name == "Congo, Rep."] <- "Congo (Brazzaville)"
+gdp$Country.Name[gdp$Country.Name == "Cote d'Ivoire"] <- "Ivory Coast"
+gdp$Country.Name[gdp$Country.Name == "Guinea-Bissau"] <- "Guinea Bissau"
+
+# Reshape to long
+gdp_long <- gdp %>%
+  pivot_longer(cols = starts_with("X"),
+               names_to = "year",
+               values_to = "GDP") %>%
+  mutate(year = gsub("X", "", year))
+
+# Merge with Africa country data
+africa_long_gdp <- inner_join(africa_long, gdp_long, by=c("name_long"="Country.Name", "year"))
+```
+
+Plot the trend of nightlights and GDP for each country. Note we stadardise the GDP and nightlights at a country level for this comparison.
+```{r}
+# Plotting trends for each country
+unique_countries <- unique(africa_long_gdp$name_long)
+
+plots_list <- list()
+
+# Loop through each country
+for (country_name in unique_countries) {
+  # Subset data for current country
+  country_data <- africa_long_gdp %>%
+    filter(name_long == country_name)
+  
+  # Scale country data
+  country_data$GDP_scale <- scale(country_data$GDP)
+  country_data$nl_scale <- scale(country_data$nl_score)
+  
+  # Create the plot for the current country
+  plot <- ggplot(country_data, aes(x = year)) +
+    geom_line(aes(y = GDP_scale, group=1, color = "GDP Scale"), size = 1.2) +
+    geom_line(aes(y = nl_scale, group=1, color = "NL Scale"), size = 1.2) +
+    labs(x = "Year", y = "Scaled Value", color = "Variable",
+         title = paste("Scaled GDP and NL Over Years for", country_name)) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    scale_color_manual(values = c("blue", "red"),
+                       labels = c("GDP", "Night lights"))
+  
+  # Store the plot in the list
+  plots_list[[country_name]] <- plot
+}
+
+plots_list
+
+```
+
+
+## Econometrics
+```{r}
+
+# Manually add AGOA variable for each country depending on when they joined the agreement
+agoa_cities_long <- agoa_cities_long %>%
+  mutate(AGOA = 0)%>%
+  mutate(AGOA = if_else(ADM0NAME == "Sudan" & year>2000, 1, AGOA))%>%
+  mutate(AGOA = if_else(ADM0NAME == "Eritrea" & year>2000, 1, AGOA))%>%
+  mutate(AGOA = if_else(ADM0NAME == "Eritrea" & year>2003, 0, AGOA))%>%
+  mutate(AGOA = if_else(ADM0NAME == "Djibouti" & year>2000, 1, AGOA))%>%
+  mutate(AGOA = if_else(ADM0NAME == "Kenya" & year>2000, 1, AGOA))%>%
+  mutate(AGOA = if_else(ADM0NAME == "Tanzania" & year>2000, 1, AGOA))%>%
+  mutate(AGOA = if_else(ADM0NAME == "South Africa" & year>2000, 1, AGOA))%>%
+  mutate(AGOA = if_else(ADM0NAME == "Namibia" & year>2000, 1, AGOA))%>%
+  mutate(AGOA = if_else(ADM0NAME == "Angola" & year>2003, 1, AGOA))%>%
+  mutate(AGOA = if_else(ADM0NAME == "Gabon" & year>2000, 1, AGOA))%>%
+  mutate(AGOA = if_else(ADM0NAME == "Congo (Brazzaville)" & year>2000, 1, AGOA))%>%
+  mutate(AGOA = if_else(ADM0NAME == "Cameroon" & year>2000, 1, AGOA))%>%
+  mutate(AGOA = if_else(ADM0NAME == "Nigeria" & year>2000, 1, AGOA))%>%
+  mutate(AGOA = if_else(ADM0NAME == "Nigeria" & year==2010, 0, AGOA))%>%
+  mutate(AGOA = if_else(ADM0NAME == "Nigeria" & year==2011, 0, AGOA))%>%
+  mutate(AGOA = if_else(ADM0NAME == "Benin" & year>2000, 1, AGOA))%>%
+  mutate(AGOA = if_else(ADM0NAME == "Togo" & year>2008, 1, AGOA))%>%
+  mutate(AGOA = if_else(ADM0NAME == "Ghana" & year>2000, 1, AGOA))%>%
+  mutate(AGOA = if_else(ADM0NAME == "Ivory Coast" & year>2011, 1, AGOA))%>%
+  mutate(AGOA = if_else(ADM0NAME == "Liberia" & year>2006, 1, AGOA))%>%
+  mutate(AGOA = if_else(ADM0NAME == "Sierra Leone" & year>2002, 1, AGOA))%>%
+  mutate(AGOA = if_else(ADM0NAME == "Guinea" & year>2000, 1, AGOA))%>%
+  mutate(AGOA = if_else(ADM0NAME == "Guinea" & year==2010, 0, AGOA))%>%
+  mutate(AGOA = if_else(ADM0NAME == "Guinea" & year==2011, 0, AGOA))%>%
+  mutate(AGOA = if_else(ADM0NAME == "Guinea Bissau" & year>2000, 1, AGOA))%>%
+  mutate(AGOA = if_else(ADM0NAME == "The Gambia" & year>2000, 1, AGOA))%>%
+  mutate(AGOA = if_else(ADM0NAME == "Senegal" & year>2000, 1, AGOA))%>%
+  mutate(AGOA = if_else(ADM0NAME == "Mauritania" & year>2000, 1, AGOA))%>%
+  mutate(AGOA = if_else(ADM0NAME == "Mauritania" & year==2007, 0, AGOA))%>%
+  mutate(AGOA = if_else(ADM0NAME == "Mauritania" & year==2008, 0, AGOA))
+
+
+# For non-agoa countries, add fake entry after 2000 for all
+non_agoa_cities_long <- non_agoa_cities_long %>%
+  mutate(AGOA = 0)%>%
+  mutate(AGOA = if_else(year>2000, 1, AGOA))
+
+```
+
+```{r}
+# Loading the distance to nearest port (constructed in the distance markdown file)
+distance <- read.csv("distance_data/AFRICA_COAST_weights.csv")
+distance_nonag <- read.csv("distance_data/AFRICA_COAST_weights_non_agoa.csv")
+
+# Adjusting Middelburg in the distance data
+subset_distance <- subset(distance, city == "Middelburg")
+subset_distance
+
+# Manually rename and remove duplicates
+distance[148, "city"] <- "Middelburg_mpu"
+distance[192, "city"] <- "Middelburg_ec"
+distance <- distance[-193, ]
+```
+
+Where we created the distance variable we had some issues of cities being duplicated, so we remove those here. Also, some cities which were close to country borders were assigned to the wrong country leading to some discrepancies in the cities included between the distance data and the nightlights data. Here we remove any settlements that don't appear in both datasets.
+```{r}
+# Check the number of matching city names
+unique_cities_agoa <- unique(agoa_cities_long$NAME)
+unique_cities_distance <- unique(distance$city)
+
+unique_to_agoa <- setdiff(unique_cities_agoa, unique_cities_distance)
+unique_to_distance <- setdiff(unique_cities_distance, unique_cities_agoa)
+
+unique_to_agoa
+unique_to_distance
+
+# Remove any cities that don't appear in both dataframes
+agoa_cities_long_filter <- subset(agoa_cities_long, !(NAME %in% unique_to_agoa))
+distance_filter <- subset(distance, !(city %in% unique_to_distance))
+
+# Check for duplicates in distance
+duplicates <- duplicated(distance_filter$city)
+duplicated_rows <- distance_filter[duplicates, ]
+
+# Remove duplicated cities from distance dataframe
+distance_filter_unique <- unique(distance_filter)
+```
+
+We now repeat similar steps to the above with the non-agoa countries (Here lots more will be dropped as we are only focusing on TUnisia and Morocco).
+```{r}
+# Check the number of matching city names - non agoa data
+unique_cities_non_agoa <- unique(non_agoa_cities_long$NAME)
+unique_cities_distance_nonag <- unique(distance_nonag$city)
+
+unique_to_non_agoa <- setdiff(unique_cities_non_agoa, unique_cities_distance_nonag)
+unique_to_distance_nonag <- setdiff(unique_cities_distance_nonag, unique_cities_non_agoa)
+
+unique_to_non_agoa
+unique_to_distance_nonag
+
+# Remove any cities that don't appear in both dataframes
+non_agoa_cities_long_filter <- subset(non_agoa_cities_long, !(NAME %in% unique_to_non_agoa))
+```
+
+Merge distance and nightlight data
+```{r}
+# Merge distance data
+merged_df <- inner_join(agoa_cities_long_filter, distance_filter_unique, by = c("NAME" = "city"))
+
+merged_nonag <- inner_join(non_agoa_cities_long_filter, distance_nonag, by = c("NAME" = "city"))
+
+
+# Convert country variable to dummy in both dataframes
+merged_df$country <- as.factor(merged_df$country)
+merged_nonag$country <- as.factor(merged_nonag$country)
+```
+
+Below we run our different econometric specifications
+```{r}
+# Regressions - baseline
+model_base <- lm(nl_score ~ AGOA + min_dist + AGOA:min_dist, data = merged_df)
+
+model_pop <- lm(nl_score ~ AGOA + min_dist + AGOA:min_dist + POP_MAX, data = merged_df)
+
+model_pop_country <- lm(nl_score ~ AGOA + min_dist + AGOA:min_dist + POP_MAX + country, data = merged_df)
+
+model_country_year <- lm(nl_score ~ AGOA + min_dist + AGOA:min_dist + POP_MAX + country:year, data = merged_df)
+
+
+stargazer(model_base, model_pop, model_pop_country, model_country_year, type = "text", title = "Regression Results",
+          omit="country",
+          align = TRUE, # Align coefficients
+          column.labels = c("Baseline", "Population", "Country dummies", "Year dummies"),
+          covariate.labels = c("AGOA" = "AGOA",
+                               "min_dist" = "Distance",
+                               "POP_MAX" = "Population",
+                               "AGOA:min_dist" = "AGOA Distance Interaction"),
+          dep.var.labels = "Night lights")
+```
+
+```{r}
+# Other specifications
+merged_df_filtered <- merged_df[merged_df$nl_score != 0, ]
+merged_df_cities <- merged_df_filtered[merged_df_filtered$POP_MAX > 50000, ]
+merged_df_non_port <- merged_df[merged_df$min_dist > 1000, ]
+
+baseline <- lm(nl_score ~ AGOA + min_dist + AGOA:min_dist + POP_MAX + country:year, data = merged_df)
+big_cities <- lm(nl_score ~ AGOA + min_dist + AGOA:min_dist + POP_MAX + country:year, data = merged_df_cities)
+non_port <- lm(nl_score ~ AGOA + min_dist + AGOA:min_dist + POP_MAX + country:year, data = merged_df_non_port)
+pseudo <- lm(nl_score ~ AGOA + min_dist + AGOA:min_dist + POP_MAX + country:year, data = merged_nonag)
+
+
+stargazer(baseline, big_cities, non_port, pseudo, type = "text", title = "Regression Results",
+          omit="country",
+          align = TRUE, # Align coefficients
+          column.labels = c("Baseline", "Cities", "Non coastal", "Pseudo"),
+          covariate.labels = c("AGOA" = "AGOA",
+                               "min_dist" = "Distance",
+                               "POP_MAX" = "Population",
+                               "AGOA:min_dist" = "AGOA Distance Interaction"),
+          dep.var.labels = "Night lights")
+```
+
+
